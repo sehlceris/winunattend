@@ -81,6 +81,8 @@ iso_build() {
     -e "$efi_img" -no-emul-boot \
     -o "$out" "$stage" 2>&1 \
     | grep -viE '^xorriso : UPDATE|done, estimate|files added' || true
+  local rc=${PIPESTATUS[0]}
+  (( rc == 0 )) || die "xorriso failed (exit $rc)."
   [[ -s "$out" ]] || die "ISO authoring produced no output."
 }
 
