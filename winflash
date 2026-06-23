@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+#
+# winflash — write a Windows ISO to a USB stick on macOS, interactively and
+# safely. Only *removable USB* drives are ever offered as targets, so you can't
+# accidentally erase your internal disk. The USB is formatted FAT32 (MBR) and
+# the ISO contents are copied file-by-file; a >4 GiB install.wim is split into
+# install.swm parts automatically so it fits FAT32. The result boots via UEFI.
+#
+# Usage:  winflash [options] <windows.iso>
+# See:    winflash --help
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ---- locate ourselves so we can find lib/ -----------------------------------
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  dir=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+  SOURCE=$(readlink "$SOURCE"); [[ "$SOURCE" != /* ]] && SOURCE="$dir/$SOURCE"
+done
+WINUNATTEND_ROOT=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+
+# shellcheck source=lib/common.sh
+. "$WINUNATTEND_ROOT/lib/common.sh"
+. "$WINUNATTEND_ROOT/lib/deps.sh"
+. "$WINUNATTEND_ROOT/lib/wim.sh"
+. "$WINUNATTEND_ROOT/lib/usb.sh"
+
+# FAT32 caps a single file at 4 GiB - 1 byte. Larger install.wim → split.
+FAT32_MAX_FILE=$(( 4 * 1024 * 1024 * 1024 - 1 ))
+
+# ---- defaults ---------------------------------------------------------------
+LABEL="WINUNATTEND"          # FAT32 volume label (<=11 chars, upper-cased)
+FSTYPE="FAT32"               # FAT32 (default) | ExFAT (--exfat, no WIM split)
+DISK=""                      # --disk diskN (non-interactive target)
+LIST_ONLY=0                  # --list: print detected USB drives and exit
+ASSUME_YES=0
+INSTALL_DEPS=0
+SOURCE_ISO=""
+
+usage() {
+  cat >&2 <<EOF
+${_c_bold}winflash${_c_reset} $VERSION — write a Windows ISO to a USB stick (macOS)
+
+${_c_bold}USAGE${_c_reset}
+  winflash [options] <windows.iso>
+
+${_c_bold}OPTIONS${_c_reset}
+      --list            List detected removable USB drives and exit (safe).
+      --disk diskN      Target this disk non-interactively (must be a USB drive).
+      --label NAME      FAT32 volume label (default: ${LABEL}; <=11 chars).
+      --exfat           Format exFAT instead of FAT32 (no install.wim split, but
+                        some older UEFI firmware can't read exFAT).
+      --install-deps    Install missing dependencies (wimlib) via Homebrew.
+  -y, --yes             Skip confirmation prompts (DANGEROUS; pair with --disk).
+  -h, --help            Show this help.
+  -V, --version         Show version.
+
+${_c_bold}SAFETY${_c_reset}
+  Only whole, external, removable USB disks are ever shown or accepted. Your
+  internal/system disk can never be selected. The chosen drive is ERASED.
+
+${_c_bold}EXAMPLES${_c_reset}
+  winflash ~/Downloads/Win11_25H2_English_x64-nomsa.iso     # pick drive, flash
+  winflash --list                                           # just show drives
+
+The USB boots Windows Setup via UEFI. Pair with winunattend to skip the
+Microsoft-account requirement.
+EOF
+}
+
+# ---- argument parsing -------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --list)         LIST_ONLY=1; shift ;;
+    --disk)         DISK="${2:?--disk needs a diskN identifier}"; shift 2 ;;
+    --label)        LABEL="${2:?--label needs a value}"; shift 2 ;;
+    --exfat)        FSTYPE="ExFAT"; shift ;;
+    --install-deps) INSTALL_DEPS=1; shift ;;
+    -y|--yes)       ASSUME_YES=1; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    -V|--version)   echo "winflash $VERSION"; exit 0 ;;
+    --)             shift; break ;;
+    -*)             die "unknown option: $1 (see --help)" ;;
+    *)              [[ -z "$SOURCE_ISO" ]] || die "unexpected extra argument: $1"
+                    SOURCE_ISO="$1"; shift ;;
+  esac
+done
+[[ -n "${1:-}" && -z "$SOURCE_ISO" ]] && SOURCE_ISO="$1"
+
+# FAT32 labels are upper-case, <=11 chars.
+LABEL=$(printf '%s' "$LABEL" | tr '[:lower:]' '[:upper:]' | cut -c1-11)
+
+require_cmd diskutil
+
+# ---- --list: enumerate and exit (non-destructive) ---------------------------
+DISKS=()
+while IFS= read -r _line; do [[ -n "$_line" ]] && DISKS+=("$_line"); done \
+  < <(usb_list_disks)
+if [[ "$LIST_ONLY" == 1 ]]; then
+  if [[ ${#DISKS[@]} -eq 0 ]]; then
+    log "No removable USB drives detected."
+  else
+    log "Detected removable USB drive(s):"
+    for d in "${DISKS[@]}"; do info "/dev/$d — $(usb_describe "$d")"; done
+  fi
+  exit 0
+fi
+
+# ---- validate ISO -----------------------------------------------------------
+[[ -n "$SOURCE_ISO" ]] || { usage; exit 1; }
+[[ -f "$SOURCE_ISO" ]] || die "ISO not found: $SOURCE_ISO"
+[[ "$SOURCE_ISO" == *.[iI][sS][oO] ]] || warn "source does not end in .iso — continuing."
+
+deps_ensure_flash
+
+# ---- choose the target USB drive --------------------------------------------
+if [[ ${#DISKS[@]} -eq 0 ]]; then
+  die "no removable USB drives detected. Plug one in and retry (see: winflash --list)."
+fi
+
+# Map a user-supplied --disk to the detected set; never trust an arbitrary id.
+target=""
+if [[ -n "$DISK" ]]; then
+  DISK=${DISK#/dev/}
+  for d in "${DISKS[@]}"; do [[ "$d" == "$DISK" ]] && target="$d"; done
+  [[ -n "$target" ]] || die "$DISK is not a detected removable USB drive (see: winflash --list)."
+elif [[ ${#DISKS[@]} -eq 1 ]]; then
+  target="${DISKS[0]}"
+  log "One USB drive detected:"
+  info "/dev/$target — $(usb_describe "$target")"
+else
+  log "Select the USB drive to flash:"
+  i=1
+  for d in "${DISKS[@]}"; do
+    printf '    %s%d)%s /dev/%s — %s\n' "$_c_bold" "$i" "$_c_reset" "$d" "$(usb_describe "$d")" >&2
+    i=$((i+1))
+  done
+  [[ -t 0 ]] || die "multiple drives and no TTY; pass --disk diskN."
+  read -r -p "  Enter number [1-${#DISKS[@]}], or q to quit: " pick
+  [[ "$pick" == q || "$pick" == Q ]] && { info "aborted."; exit 0; }
+  [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#DISKS[@]} )) \
+    || die "invalid selection: $pick"
+  target="${DISKS[$((pick-1))]}"
+fi
+
+tgt_size=$(usb_disk_size "$target")
+iso_bytes=$(file_size "$SOURCE_ISO")
+
+# ---- final, explicit confirmation -------------------------------------------
+log "About to ERASE and flash:"
+info "iso    : $SOURCE_ISO ($(human_size "$iso_bytes"))"
+info "target : /dev/$target — $(usb_describe "$target")"
+info "format : $FSTYPE (MBR), label $LABEL"
+warn "ALL DATA ON /dev/$target WILL BE PERMANENTLY ERASED."
+if (( iso_bytes > tgt_size )); then
+  die "ISO ($(human_size "$iso_bytes")) is larger than the drive ($(human_size "$tgt_size"))."
+fi
+
+if [[ "$ASSUME_YES" != 1 ]]; then
+  [[ -t 0 ]] || die "non-interactive and --yes not given; refusing to erase."
+  read -r -p "  Type the disk id ($target) to confirm erase: " typed
+  [[ "$typed" == "$target" ]] || die "confirmation did not match; aborted."
+fi
+
+# ---- format the USB (FAT32/exFAT, MBR) --------------------------------------
+# MBR (not GPT): GPT makes diskutil add an EFI partition that breaks the Windows
+# installer on macOS-formatted media. UEFI firmware boots FAT/exFAT under MBR
+# fine via \EFI\BOOT\BOOTX64.EFI.
+log "Unmounting and erasing /dev/$target…"
+diskutil unmountDisk force "/dev/$target" >/dev/null 2>&1 || true
+if ! diskutil eraseDisk "$FSTYPE" "$LABEL" MBRFormat "/dev/$target" >/dev/null; then
+  die "diskutil eraseDisk failed for /dev/$target."
+fi
+
+# Resolve the freshly-created volume's mount point (usually /Volumes/$LABEL).
+DEST=$(diskutil info -plist "${target}s1" 2>/dev/null \
+       | plutil -extract MountPoint raw -o - - 2>/dev/null)
+[[ -n "$DEST" && -d "$DEST" ]] || DEST="/Volumes/$LABEL"
+[[ -d "$DEST" ]] || die "could not locate the formatted volume mount point."
+ok "formatted: $DEST"
+
+# ---- mount the ISO and copy its contents ------------------------------------
+MOUNT=""
+cleanup() {
+  [[ -n "$MOUNT" ]] && hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+MOUNT=$(hdiutil mount -readonly -nobrowse "$SOURCE_ISO" 2>/dev/null \
+        | awk -F'\t' 'END{print $NF}')
+[[ -n "$MOUNT" && -d "$MOUNT" ]] || die "failed to mount ISO: $SOURCE_ISO"
+[[ -d "$MOUNT/sources" ]] || warn "ISO has no /sources — is this a Windows ISO?"
+
+log "Copying Windows files to the USB (this can take several minutes)…"
+rsync -rt --no-perms --no-owner --no-group --modify-window=2 \
+  --exclude '/sources/install.wim' --exclude '/sources/install.esd' \
+  "$MOUNT"/ "$DEST"/ || die "copying files to the USB failed."
+
+# Handle the large install image: split onto FAT32, copy whole onto exFAT.
+for img in install.wim install.esd; do
+  src="$MOUNT/sources/$img"
+  [[ -f "$src" ]] || continue
+  sz=$(file_size "$src")
+  if [[ "$FSTYPE" == FAT32 ]] && (( sz > FAT32_MAX_FILE )); then
+    log "Splitting sources/$img ($(human_size "$sz")) into .swm parts for FAT32…"
+    wim_split_one "$src" "$DEST/sources/install.swm"
+  else
+    log "Copying sources/$img ($(human_size "$sz"))…"
+    cp "$src" "$DEST/sources/$img" || die "failed to copy $img to the USB."
+  fi
+done
+
+# ---- bootability check ------------------------------------------------------
+if [[ ! -e "$DEST/efi/boot/bootx64.efi" && ! -e "$DEST/EFI/BOOT/BOOTX64.EFI" ]]; then
+  warn "no efi/boot/bootx64.efi on the media — the USB may not boot via UEFI."
+fi
+
+# ---- finish: flush and eject ------------------------------------------------
+log "Flushing writes (sync)…"
+sync
+hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; MOUNT=""
+log "Ejecting /dev/$target…"
+diskutil eject "/dev/$target" >/dev/null 2>&1 || warn "could not auto-eject; eject it manually."
+
+ok "done — flashed $(basename "$SOURCE_ISO") to /dev/$target ($FSTYPE)."
+info "Boot the target machine from this USB in UEFI mode."

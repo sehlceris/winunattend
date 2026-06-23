@@ -44,6 +44,31 @@ deps_ensure() {
   fi
 }
 
+# winflash needs wimlib (to split a >4 GiB install.wim onto FAT32) plus the
+# macOS built-ins diskutil/hdiutil/rsync. Installs wimlib via Homebrew on
+# consent, mirroring deps_ensure.
+deps_ensure_flash() {
+  require_cmd diskutil
+  require_cmd hdiutil
+  require_cmd rsync
+  command -v wimlib-imagex >/dev/null 2>&1 && return 0
+
+  warn "missing dependency: wimlib (needed to split install.wim onto FAT32)"
+  if ! deps_have_brew; then
+    err "Homebrew is not installed."
+    info "Install Homebrew from https://brew.sh then run:  brew install wimlib"
+    exit 1
+  fi
+  if [[ "${INSTALL_DEPS:-0}" == 1 ]] || confirm "Install wimlib with Homebrew now?"; then
+    log "Installing wimlib via Homebrew…"
+    brew install wimlib || die "brew install failed"
+    ok "wimlib installed."
+  else
+    info "Install it yourself with:  brew install wimlib"
+    exit 1
+  fi
+}
+
 # Best-effort path to a qemu system binary for the given arch (or empty).
 deps_qemu_bin() {
   case "${1:-amd64}" in
