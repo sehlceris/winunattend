@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+#
+# winunattend — turn an official Windows 10/11 ISO into one that installs
+# without a Microsoft account or internet connection (and without the Win11
+# TPM/Secure Boot/RAM checks). Runs entirely on macOS.
+#
+# Usage:  winunattend [options] <source.iso>
+# See:    winunattend --help
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ---- locate ourselves so we can find lib/ and templates/ --------------------
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  dir=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+  SOURCE=$(readlink "$SOURCE"); [[ "$SOURCE" != /* ]] && SOURCE="$dir/$SOURCE"
+done
+WINUNATTEND_ROOT=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+TEMPLATE_FILE="$WINUNATTEND_ROOT/templates/autounattend.default.xml"
+
+# shellcheck source=lib/common.sh
+. "$WINUNATTEND_ROOT/lib/common.sh"
+. "$WINUNATTEND_ROOT/lib/deps.sh"
+. "$WINUNATTEND_ROOT/lib/answerfile.sh"
+. "$WINUNATTEND_ROOT/lib/iso.sh"
+
+# ---- defaults (overridable by flags) ----------------------------------------
+ARCH="amd64"                 # amd64 (x64) | arm64 — must match the Windows ISO
+UILANG="en-US"
+INPUTLOCALE="0409:00000409"
+BYPASS_HW=1                  # bypass Win11 TPM/SecureBoot/RAM/CPU checks
+SUFFIX="-nomsa"              # appended to the source name for the default output
+ASSUME_YES=0
+INSTALL_DEPS=0
+KEEP_WORK=0
+USER_XML=""                  # --autounattend FILE
+OUTPUT=""                    # --output FILE
+VOLID_OVERRIDE=""            # --volid LABEL
+SOURCE_ISO=""
+
+usage() {
+  cat >&2 <<EOF
+${_c_bold}winunattend${_c_reset} $VERSION — Windows ISO → no-Microsoft-account ISO (macOS)
+
+${_c_bold}USAGE${_c_reset}
+  winunattend [options] <source.iso>
+
+${_c_bold}OPTIONS${_c_reset}
+  -o, --output FILE     Output ISO path
+                        (default: <source>${SUFFIX}.iso next to the source)
+      --autounattend F  Inject your own answer file instead of the built-in
+                        default (e.g. one from schneegans.de). Implies you have
+                        already configured account/bypass behavior yourself.
+      --arch ARCH       amd64 (default) or arm64 — must match the Windows ISO.
+      --lang LANG       UI language / locale for the default answer file
+                        (default: ${UILANG}).
+      --keyboard ID     Input locale id for the default answer file
+                        (default: ${INPUTLOCALE}).
+      --no-bypass-hw    Do NOT bypass the Win11 TPM/Secure Boot/RAM/CPU checks.
+      --volid LABEL     Override the output volume label
+                        (default: copied from the source ISO).
+      --install-deps    Install missing dependencies (xorriso) via Homebrew.
+      --keep-work       Keep the temporary working directory.
+  -y, --yes             Assume "yes" to prompts (non-interactive).
+  -h, --help            Show this help.
+  -V, --version         Show version.
+
+${_c_bold}EXAMPLES${_c_reset}
+  # Default: bypass MS account + hardware checks, user makes a local account
+  winunattend ~/Downloads/Win11_25H2_English_x64.iso
+
+  # Custom output name and your own schneegans answer file
+  winunattend --autounattend ./autounattend.xml -o ~/Win11_custom.iso Win11.iso
+
+The produced ISO boots on bare-metal UEFI machines and Proxmox VMs, and can be
+written to USB with WinDiskWriter. See README.md for Proxmox/VirtIO notes.
+EOF
+}
+
+# ---- argument parsing -------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output)      OUTPUT="${2:?--output needs a path}"; shift 2 ;;
+    --autounattend)   USER_XML="${2:?--autounattend needs a file}"; shift 2 ;;
+    --arch)           ARCH="${2:?--arch needs a value}"; shift 2 ;;
+    --lang)           UILANG="${2:?--lang needs a value}"; shift 2 ;;
+    --keyboard)       INPUTLOCALE="${2:?--keyboard needs a value}"; shift 2 ;;
+    --no-bypass-hw)   BYPASS_HW=0; shift ;;
+    --volid)          VOLID_OVERRIDE="${2:?--volid needs a value}"; shift 2 ;;
+    --install-deps)   INSTALL_DEPS=1; shift ;;
+    --keep-work)      KEEP_WORK=1; shift ;;
+    -y|--yes)         ASSUME_YES=1; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    -V|--version)     echo "winunattend $VERSION"; exit 0 ;;
+    --)               shift; break ;;
+    -*)               die "unknown option: $1 (see --help)" ;;
+    *)                [[ -z "$SOURCE_ISO" ]] || die "unexpected extra argument: $1"
+                      SOURCE_ISO="$1"; shift ;;
+  esac
+done
+[[ -n "${1:-}" && -z "$SOURCE_ISO" ]] && SOURCE_ISO="$1"
+
+# normalize arch aliases
+case "$ARCH" in
+  x64|x86_64|amd64) ARCH="amd64" ;;
+  aarch64|arm64)    ARCH="arm64" ;;
+  *) die "unsupported --arch: $ARCH (use amd64 or arm64)" ;;
+esac
+
+# ---- validate inputs --------------------------------------------------------
+[[ -n "$SOURCE_ISO" ]] || { usage; exit 1; }
+[[ -f "$SOURCE_ISO" ]] || die "source ISO not found: $SOURCE_ISO"
+[[ "$SOURCE_ISO" == *.iso || "$SOURCE_ISO" == *.ISO ]] \
+  || warn "source does not end in .iso — continuing anyway."
+
+if [[ -z "$OUTPUT" ]]; then
+  base=${SOURCE_ISO%.[iI][sS][oO]}
+  OUTPUT="${base}${SUFFIX}.iso"
+fi
+[[ "$(cd "$(dirname "$OUTPUT")" && pwd)/$(basename "$OUTPUT")" \
+   != "$(cd "$(dirname "$SOURCE_ISO")" && pwd)/$(basename "$SOURCE_ISO")" ]] \
+  || die "output would overwrite the source ISO; choose a different --output."
+if [[ -e "$OUTPUT" ]]; then
+  confirm "output exists, overwrite $OUTPUT ?" || die "aborted."
+  rm -f "$OUTPUT"
+fi
+
+deps_ensure
+
+# ---- summarize plan ---------------------------------------------------------
+src_bytes=$(file_size "$SOURCE_ISO")
+log "winunattend $VERSION"
+info "source : $SOURCE_ISO ($(human_size "$src_bytes"))"
+info "output : $OUTPUT"
+if [[ -n "$USER_XML" ]]; then
+  info "answer : $USER_XML (your file)"
+else
+  info "answer : built-in default — arch=$ARCH lang=$UILANG bypass-hw=$BYPASS_HW"
+fi
+
+iso_check_source "$SOURCE_ISO"
+
+VOLID="$VOLID_OVERRIDE"
+if [[ -z "$VOLID" ]]; then
+  VOLID=$(iso_get_volid "$SOURCE_ISO")
+  [[ -n "$VOLID" ]] || { VOLID="WIN_CUSTOM"; warn "could not read volume id; using $VOLID."; }
+fi
+info "volid  : $VOLID"
+
+# ---- stage the answer file --------------------------------------------------
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/winunattend.XXXXXX")
+cleanup() { [[ "$KEEP_WORK" == 1 ]] && { info "kept work dir: $WORK"; return; }; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+ANSWER="$WORK/autounattend.xml"
+answerfile_resolve "$ANSWER"
+ok "answer file ready ($(human_size "$(file_size "$ANSWER")"))."
+
+# ---- rebuild ----------------------------------------------------------------
+iso_repack "$SOURCE_ISO" "$OUTPUT" "$VOLID" \
+  -map "$ANSWER" /autounattend.xml
+
+# ---- verify -----------------------------------------------------------------
+log "Verifying output…"
+if iso_verify "$OUTPUT" /autounattend.xml; then
+  out_bytes=$(file_size "$OUTPUT")
+  ok "done: $OUTPUT ($(human_size "$out_bytes"))"
+  info "Write to USB with WinDiskWriter, or attach as a CD in Proxmox."
+else
+  die "verification failed — the output ISO may be unusable."
+fi
