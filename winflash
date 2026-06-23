@@ -183,20 +183,55 @@ ok "formatted: $DEST"
 
 # ---- mount the ISO and copy its contents ------------------------------------
 MOUNT=""
+PROGRESS_PID=""
 cleanup() {
+  [[ -n "$PROGRESS_PID" ]] && kill "$PROGRESS_PID" >/dev/null 2>&1 || true
   [[ -n "$MOUNT" ]] && hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
+
+# Live copy-progress: macOS rsync is too old for --info=progress2, so we derive
+# progress from how full the destination volume becomes. Covers both the rsync
+# copy and the install.wim → .swm split (both write to $DEST). Runs until killed.
+flash_progress() {
+  local dest=$1 total=$2 used pct last=-1
+  while :; do
+    used=$(df -k "$dest" 2>/dev/null | awk 'NR==2{print $3}')
+    if [[ -n "$used" ]]; then
+      used=$(( used * 1024 )); pct=0
+      (( total > 0 )) && pct=$(( used * 100 / total ))
+      (( pct > 100 )) && pct=100
+      if (( pct != last )); then
+        printf '\r    %s%3d%%%s  %s / %s written   ' \
+          "$_c_grn" "$pct" "$_c_reset" "$(human_size "$used")" "$(human_size "$total")" >&2
+        last=$pct
+      fi
+    fi
+    sleep 2
+  done
+}
+stop_progress() {
+  [[ -n "$PROGRESS_PID" ]] && { kill "$PROGRESS_PID" >/dev/null 2>&1 || true; wait "$PROGRESS_PID" 2>/dev/null || true; }
+  PROGRESS_PID=""
+  printf '\r%*s\r' 72 '' >&2   # clear the progress line
+}
 
 MOUNT=$(hdiutil mount -readonly -nobrowse "$SOURCE_ISO" 2>/dev/null \
         | awk -F'\t' 'END{print $NF}')
 [[ -n "$MOUNT" && -d "$MOUNT" ]] || die "failed to mount ISO: $SOURCE_ISO"
 [[ -d "$MOUNT/sources" ]] || warn "ISO has no /sources — is this a Windows ISO?"
 
-log "Copying Windows files to the USB (this can take several minutes)…"
+# Total payload size (drives the percentage). du on the UDF mount is a metadata
+# walk — fast. Fall back to the ISO size if it can't be read.
+COPY_TOTAL=$(du -sk "$MOUNT" 2>/dev/null | awk '{print $1*1024}')
+[[ -n "$COPY_TOTAL" && "$COPY_TOTAL" -gt 0 ]] 2>/dev/null || COPY_TOTAL=$iso_bytes
+
+log "Copying Windows files to the USB (~$(human_size "$COPY_TOTAL"), several minutes)…"
+flash_progress "$DEST" "$COPY_TOTAL" & PROGRESS_PID=$!
+
 rsync -rt --no-perms --no-owner --no-group --modify-window=2 \
   --exclude '/sources/install.wim' --exclude '/sources/install.esd' \
-  "$MOUNT"/ "$DEST"/ || die "copying files to the USB failed."
+  "$MOUNT"/ "$DEST"/ || { stop_progress; die "copying files to the USB failed."; }
 
 # Handle the large install image: split onto FAT32, copy whole onto exFAT.
 for img in install.wim install.esd; do
@@ -204,13 +239,13 @@ for img in install.wim install.esd; do
   [[ -f "$src" ]] || continue
   sz=$(file_size "$src")
   if [[ "$FSTYPE" == FAT32 ]] && (( sz > FAT32_MAX_FILE )); then
-    log "Splitting sources/$img ($(human_size "$sz")) into .swm parts for FAT32…"
     wim_split_one "$src" "$DEST/sources/install.swm"
   else
-    log "Copying sources/$img ($(human_size "$sz"))…"
-    cp "$src" "$DEST/sources/$img" || die "failed to copy $img to the USB."
+    cp "$src" "$DEST/sources/$img" || { stop_progress; die "failed to copy $img to the USB."; }
   fi
 done
+stop_progress
+ok "copied $(human_size "$COPY_TOTAL") to the USB."
 
 # ---- bootability check ------------------------------------------------------
 if [[ ! -e "$DEST/efi/boot/bootx64.efi" && ! -e "$DEST/EFI/BOOT/BOOTX64.EFI" ]]; then
