@@ -24,6 +24,7 @@ TEMPLATE_FILE="$WINUNATTEND_ROOT/templates/autounattend.default.xml"
 . "$WINUNATTEND_ROOT/lib/common.sh"
 . "$WINUNATTEND_ROOT/lib/deps.sh"
 . "$WINUNATTEND_ROOT/lib/answerfile.sh"
+. "$WINUNATTEND_ROOT/lib/wim.sh"
 . "$WINUNATTEND_ROOT/lib/iso.sh"
 
 # ---- defaults (overridable by flags) ----------------------------------------
@@ -31,6 +32,8 @@ ARCH="amd64"                 # amd64 (x64) | arm64 — must match the Windows IS
 UILANG="en-US"
 INPUTLOCALE="0409:00000409"
 BYPASS_HW=1                  # bypass Win11 TPM/SecureBoot/RAM/CPU checks
+NOPROMPT=0                   # use efisys_noprompt.bin (no "press any key")
+NO_SPLIT=0                   # do not split a >4 GiB install.wim (advanced)
 SUFFIX="-nomsa"              # appended to the source name for the default output
 ASSUME_YES=0
 INSTALL_DEPS=0
@@ -59,6 +62,10 @@ ${_c_bold}OPTIONS${_c_reset}
       --keyboard ID     Input locale id for the default answer file
                         (default: ${INPUTLOCALE}).
       --no-bypass-hw    Do NOT bypass the Win11 TPM/Secure Boot/RAM/CPU checks.
+      --noprompt        Boot without the "Press any key to boot from CD" prompt
+                        (uses efisys_noprompt.bin; nice for hands-off VMs).
+      --no-split        Do NOT split a >4 GiB install.wim (advanced; the output
+                        may be unreadable by Setup / on FAT32 USB).
       --volid LABEL     Override the output volume label
                         (default: copied from the source ISO).
       --install-deps    Install missing dependencies (xorriso) via Homebrew.
@@ -88,6 +95,8 @@ while [[ $# -gt 0 ]]; do
     --lang)           UILANG="${2:?--lang needs a value}"; shift 2 ;;
     --keyboard)       INPUTLOCALE="${2:?--keyboard needs a value}"; shift 2 ;;
     --no-bypass-hw)   BYPASS_HW=0; shift ;;
+    --noprompt)       NOPROMPT=1; shift ;;
+    --no-split)       NO_SPLIT=1; shift ;;
     --volid)          VOLID_OVERRIDE="${2:?--volid needs a value}"; shift 2 ;;
     --install-deps)   INSTALL_DEPS=1; shift ;;
     --keep-work)      KEEP_WORK=1; shift ;;
@@ -149,24 +158,65 @@ if [[ -z "$VOLID" ]]; then
 fi
 info "volid  : $VOLID"
 
-# ---- stage the answer file --------------------------------------------------
+# ---- working directory (needs room for the extracted tree + answer file) ----
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/winunattend.XXXXXX")
-cleanup() { [[ "$KEEP_WORK" == 1 ]] && { info "kept work dir: $WORK"; return; }; rm -rf "$WORK"; }
-trap cleanup EXIT
+STAGE="$WORK/iso_root"
+mkdir -p "$STAGE"
+MOUNT=""
+cleanup() {
+  iso_unmount "$MOUNT"
+  if [[ "$KEEP_WORK" == 1 ]]; then info "kept work dir: $WORK"; else rm -rf "$WORK"; fi
+}
+trap cleanup EXIT INT TERM
 
-ANSWER="$WORK/autounattend.xml"
-answerfile_resolve "$ANSWER"
-ok "answer file ready ($(human_size "$(file_size "$ANSWER")"))."
+# Rough free-space sanity check: we need ~1x the source for staging plus ~1x for
+# the output, on the work and output filesystems respectively.
+work_free=$(df -k "$WORK" | awk 'END{print $4*1024}')
+if (( work_free < src_bytes + src_bytes / 5 )); then
+  warn "low free space in ${TMPDIR:-/tmp} ($(human_size "$work_free")); need ~$(human_size "$src_bytes")."
+  confirm "continue anyway?" || die "aborted."
+fi
 
-# ---- rebuild ----------------------------------------------------------------
-iso_repack "$SOURCE_ISO" "$OUTPUT" "$VOLID" \
-  -map "$ANSWER" /autounattend.xml
+# ---- extract the source tree (UDF → staging) --------------------------------
+MOUNT=$(iso_mount "$SOURCE_ISO")
+[[ -d "$MOUNT/sources" ]] || warn "mounted ISO has no /sources — is this a Windows ISO?"
+iso_extract_tree "$MOUNT" "$STAGE"
+# Pull the large install image(s) we excluded, splitting on the way in.
+for img in install.wim install.esd; do
+  [[ -f "$MOUNT/sources/$img" ]] || continue
+  sz=$(file_size "$MOUNT/sources/$img")
+  if [[ "$NO_SPLIT" != 1 ]] && (( sz > WIM_LIMIT_BYTES )); then
+    wim_split_one "$MOUNT/sources/$img" "$STAGE/sources/install.swm"
+  else
+    log "Copying sources/$img ($(human_size "$sz"))…"
+    cp "$MOUNT/sources/$img" "$STAGE/sources/$img"
+    [[ "$NO_SPLIT" == 1 ]] && (( sz > WIM_LIMIT_BYTES )) && \
+      warn "$img exceeds 4 GiB and --no-split was set; output may be unreadable."
+  fi
+done
+iso_unmount "$MOUNT"; MOUNT=""
+
+# ---- inject the answer file -------------------------------------------------
+answerfile_resolve "$STAGE/autounattend.xml"
+ok "answer file ready ($(human_size "$(file_size "$STAGE/autounattend.xml")"))."
+
+# ---- choose UEFI boot image -------------------------------------------------
+EFI_IMG="efi/microsoft/boot/efisys.bin"
+if [[ "$NOPROMPT" == 1 ]]; then
+  if [[ -f "$STAGE/efi/microsoft/boot/efisys_noprompt.bin" ]]; then
+    EFI_IMG="efi/microsoft/boot/efisys_noprompt.bin"
+  else
+    warn "efisys_noprompt.bin not found in source; keeping the boot prompt."
+  fi
+fi
+
+# ---- author the new ISO -----------------------------------------------------
+iso_build "$STAGE" "$OUTPUT" "$VOLID" "$EFI_IMG"
 
 # ---- verify -----------------------------------------------------------------
 log "Verifying output…"
-if iso_verify "$OUTPUT" /autounattend.xml; then
-  out_bytes=$(file_size "$OUTPUT")
-  ok "done: $OUTPUT ($(human_size "$out_bytes"))"
+if iso_verify "$OUTPUT" /autounattend.xml /sources/boot.wim; then
+  ok "done: $OUTPUT ($(human_size "$(file_size "$OUTPUT")"))"
   info "Write to USB with WinDiskWriter, or attach as a CD in Proxmox."
 else
   die "verification failed — the output ISO may be unusable."

@@ -2,37 +2,44 @@
 # deps.sh — dependency detection and installation (macOS / Homebrew).
 # Sourced by the winunattend entrypoint.
 
-# winunattend needs:
-#   xorriso  — read/rewrite the bootable ISO (brew install xorriso)
-#   hdiutil  — mount ISOs (ships with macOS)
-# Optional:
-#   qemu     — boot-test the produced ISO (brew install qemu)
+# winunattend needs (Homebrew formula → command):
+#   xorriso  → xorriso         author the bootable ISO
+#   wimlib   → wimlib-imagex   split a >4 GiB install.wim
+# Ships with macOS: hdiutil (mount ISOs), rsync.
+# Optional: qemu — boot-test the produced ISO (brew install qemu).
+
+# formula:command pairs we require
+DEPS_REQUIRED=( "xorriso:xorriso" "wimlib:wimlib-imagex" )
 
 deps_have_brew() { command -v brew >/dev/null 2>&1; }
 
-# Ensure xorriso is available. With $INSTALL_DEPS=1 (or interactive consent)
-# it will `brew install xorriso`; otherwise it prints instructions and exits.
+# Ensure all required tools exist. With $INSTALL_DEPS=1 (or interactive consent)
+# missing ones are installed via Homebrew; otherwise we print instructions and exit.
 deps_ensure() {
-  if command -v xorriso >/dev/null 2>&1; then
-    return 0
-  fi
+  local missing=() pair formula cmd
+  for pair in "${DEPS_REQUIRED[@]}"; do
+    formula=${pair%%:*}; cmd=${pair##*:}
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$formula")
+  done
+  require_cmd hdiutil   # macOS built-in; bail clearly if somehow absent
+  require_cmd rsync
 
-  warn "xorriso is not installed (required to rebuild the ISO)."
+  [[ ${#missing[@]} -eq 0 ]] && return 0
 
+  warn "missing dependencies: ${missing[*]}"
   if ! deps_have_brew; then
     err "Homebrew is not installed."
     info "Install Homebrew from https://brew.sh then run:"
-    info "    brew install xorriso"
+    info "    brew install ${missing[*]}"
     exit 1
   fi
 
-  if [[ "${INSTALL_DEPS:-0}" == 1 ]] || confirm "Install xorriso with Homebrew now?"; then
-    log "Installing xorriso via Homebrew…"
-    brew install xorriso || die "brew install xorriso failed"
-    command -v xorriso >/dev/null 2>&1 || die "xorriso still not found after install"
-    ok "xorriso installed."
+  if [[ "${INSTALL_DEPS:-0}" == 1 ]] || confirm "Install ${missing[*]} with Homebrew now?"; then
+    log "Installing ${missing[*]} via Homebrew…"
+    brew install "${missing[@]}" || die "brew install failed"
+    ok "dependencies installed."
   else
-    info "Install it yourself with:  brew install xorriso"
+    info "Install them yourself with:  brew install ${missing[*]}"
     exit 1
   fi
 }
