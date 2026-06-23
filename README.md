@@ -10,7 +10,8 @@ The output ISO:
 - Boots via **UEFI** on bare-metal machines and **Proxmox VMs** (OVMF). UEFI is
   the validated path — and the only mode Windows 11 installs in. A legacy-BIOS
   El Torito entry is included best-effort (see [Boot modes](#boot-modes)).
-- Can be written to a USB stick with [WinDiskWriter](https://github.com/TechUnRestricted/WinDiskWriter).
+- Can be written to a USB stick with the bundled **[`winflash`](#writing-to-usb-winflash)**
+  tool (or with [WinDiskWriter](https://github.com/TechUnRestricted/WinDiskWriter)).
 - Can be attached as a CD in Proxmox / QEMU / UTM.
 
 By default it lets you create your **own local account** interactively during
@@ -171,11 +172,43 @@ qm create 200 --name win11 --memory 8192 --cores 4 --cpu host \
   --ostype win11 --boot order=scsi0
 ```
 
-## Writing to USB (bare metal)
+## Writing to USB (`winflash`)
 
-Use [WinDiskWriter](https://github.com/TechUnRestricted/WinDiskWriter) on macOS
-— it handles the FAT32/`install.wim` split automatically. Boot the target
-machine from the USB in UEFI mode.
+The repo ships **`winflash`**, an interactive macOS CLI that writes a Windows
+ISO to a USB stick — with a safety model built around *not nuking your Mac's
+internal disk*:
+
+```bash
+winflash ~/Downloads/Win11_25H2_English_x64-nomsa.iso
+```
+
+It lists only **removable USB drives**, you pick one, type its `diskN` id to
+confirm, and it:
+
+1. Formats the stick **FAT32 (MBR)** — MBR because GPT makes macOS add an EFI
+   partition that breaks the Windows installer (WinDiskWriter's hard-won lesson).
+2. Mounts the ISO's UDF tree and copies every file to the stick.
+3. **Splits** any `install.wim` larger than 4 GiB into `install.swm` parts so it
+   fits FAT32 (an ISO already processed by `winunattend` is pre-split, so this
+   is a no-op). Windows Setup reads the `.swm` parts natively.
+4. Ejects the stick. Boot the target machine from it in **UEFI** mode.
+
+| Option | Description |
+| --- | --- |
+| `--list` | List detected removable USB drives and exit (safe, non-destructive). |
+| `--disk diskN` | Target a specific disk non-interactively (must be a detected USB drive). |
+| `--label NAME` | FAT32 volume label (default `WINUNATTEND`, ≤ 11 chars). |
+| `--exfat` | Format exFAT instead of FAT32 — copies `install.wim` whole (no split), but some older UEFI firmware can't read exFAT. |
+| `--install-deps` | Install missing dependencies (wimlib) via Homebrew. |
+| `-y, --yes` | Skip confirmation prompts — **dangerous**; pair with `--disk`. |
+
+**Safety:** `winflash` only ever surfaces *whole, external, physical, removable*
+disks (filtered through `diskutil` at two layers), and a `--disk` value is
+rejected unless it's in that detected set — so the internal/system disk can
+never be selected, even by an explicit flag or a typo.
+
+Prefer a GUI? [WinDiskWriter](https://github.com/TechUnRestricted/WinDiskWriter)
+does the same job and also handles the FAT32/`install.wim` split.
 
 ## Security notes
 

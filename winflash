@@ -168,7 +168,7 @@ fi
 # MBR (not GPT): GPT makes diskutil add an EFI partition that breaks the Windows
 # installer on macOS-formatted media. UEFI firmware boots FAT/exFAT under MBR
 # fine via \EFI\BOOT\BOOTX64.EFI.
-log "Unmounting and erasing /dev/$target…"
+log "Unmounting and erasing /dev/${target}…"
 diskutil unmountDisk force "/dev/$target" >/dev/null 2>&1 || true
 if ! diskutil eraseDisk "$FSTYPE" "$LABEL" MBRFormat "/dev/$target" >/dev/null; then
   die "diskutil eraseDisk failed for /dev/$target."
@@ -221,7 +221,7 @@ fi
 log "Flushing writes (sync)…"
 sync
 hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; MOUNT=""
-log "Ejecting /dev/$target…"
+log "Ejecting /dev/${target}…"
 diskutil eject "/dev/$target" >/dev/null 2>&1 || warn "could not auto-eject; eject it manually."
 
 ok "done — flashed $(basename "$SOURCE_ISO") to /dev/$target ($FSTYPE)."
