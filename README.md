@@ -7,7 +7,9 @@ or Intel). No Windows machine, no Rufus.
 
 The output ISO:
 
-- Boots on **bare-metal UEFI machines** and **Proxmox VMs** (BIOS + UEFI).
+- Boots via **UEFI** on bare-metal machines and **Proxmox VMs** (OVMF). UEFI is
+  the validated path — and the only mode Windows 11 installs in. A legacy-BIOS
+  El Torito entry is included best-effort (see [Boot modes](#boot-modes)).
 - Can be written to a USB stick with [WinDiskWriter](https://github.com/TechUnRestricted/WinDiskWriter).
 - Can be attached as a CD in Proxmox / QEMU / UTM.
 
@@ -124,6 +126,19 @@ therefore extracts and rebuilds:
 > modern `install.wim` is often 5–8 GB. Splitting into `.swm` parts is the
 > portable fix that works everywhere — booting a CD in Proxmox, and writing to a
 > FAT32 USB with WinDiskWriter (which then needs no further splitting).
+
+## Boot modes
+
+**UEFI is the supported path.** Windows 11 only installs in UEFI/GPT mode, and
+the output ISO is validated booting under OVMF (QEMU/Proxmox) and on UEFI
+hardware. Boot your VM/machine in UEFI mode.
+
+The ISO also carries a legacy-BIOS El Torito entry, but **legacy-BIOS booting a
+rebuilt Windows 11 ISO is best-effort and may fail**: modern `cdboot`
+(`etfsboot.com`) resolves `BOOTMGR` from the UDF filesystem, which can't be
+recreated with the open-source ISO tooling used here. This is not a practical
+limitation for Windows 11, which requires UEFI regardless. (Legacy boot is more
+likely to work for older Windows 10 media.)
 
 ## Proxmox VM notes
 
