@@ -13,5 +13,8 @@
 # macOS
 .DS_Store
 
+# Claude Code session/agent state
+.claude/
+
 # Local planning doc
 /win11-unattended-iso-spec.md

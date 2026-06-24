@@ -36,7 +36,7 @@ rebuilds a bootable ISO with `xorriso`.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/winunattend.git
+git clone https://github.com/sehlceris/winunattend.git
 cd winunattend
 brew install xorriso wimlib              # or pass --install-deps on first run
 ./winunattend --help
