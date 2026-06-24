@@ -27,7 +27,7 @@ usb_list_disks() {
     [[ "$(_usb_plist_get Internal          <<<"$info")" == false    ]] || continue
     [[ "$(_usb_plist_get WholeDisk         <<<"$info")" == true     ]] || continue
     [[ "$(_usb_plist_get VirtualOrPhysical <<<"$info")" == Physical ]] || continue
-    [[ "$(_usb_plist_get Writable          <<<"$info")" == true     ]] || continue
+    [[ "$(_usb_plist_get WritableMedia     <<<"$info")" == true     ]] || continue
     # Genuinely removable media: ejectable, flagged removable, or on the USB bus.
     if [[ "$(_usb_plist_get Ejectable      <<<"$info")" == true \
        || "$(_usb_plist_get RemovableMedia <<<"$info")" == true \
